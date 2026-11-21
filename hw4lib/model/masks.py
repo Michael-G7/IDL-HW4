@@ -23,8 +23,12 @@ def PadMask(padded_input, input_lengths):
     Returns:
         Boolean mask tensor with shape (N, T).
     """
-    # TODO: Implement PadMask
-    raise NotImplementedError # Remove once implemented
+    if padded_input.ndim < 2:
+        raise ValueError("padded_input must have shape (batch, time, ...)")
+    if input_lengths.ndim != 1 or input_lengths.size(0) != padded_input.size(0):
+        raise ValueError("input_lengths must have shape (batch_size,)")
+    positions = torch.arange(padded_input.size(1), device=padded_input.device)
+    return positions.unsqueeze(0) >= input_lengths.to(padded_input.device).unsqueeze(1)
 
 ''' 
 TODO: Implement this function.
@@ -46,5 +50,10 @@ def CausalMask(padded_input):
     Returns:
         Boolean mask tensor with shape (T, T).
     """
-    raise NotImplementedError
-
+    if padded_input.ndim < 2:
+        raise ValueError("padded_input must have shape (batch, time, ...)")
+    seq_len = padded_input.size(1)
+    return torch.triu(
+        torch.ones((seq_len, seq_len), dtype=torch.bool, device=padded_input.device),
+        diagonal=1,
+    )

@@ -1,5 +1,6 @@
 import numpy as np
 
+
 class Linear:
     def __init__(self, in_features, out_features):
         """
@@ -11,6 +12,8 @@ class Linear:
         self.W = np.zeros((out_features, in_features))
         self.b = np.zeros(out_features)
 
+    def __call__(self, A):
+        return self.forward(A)
 
     def init_weights(self, W, b):
         """
@@ -24,15 +27,21 @@ class Linear:
         """
         :param A: Input to the linear layer with shape (*, in_features)
         :return: Output Z with shape (*, out_features)
-        
-        Handles arbitrary batch dimensions like PyTorch
+
+        Handles arbitrary batch/leading dimensions like PyTorch.
         """
         # TODO: Implement forward pass
-        
         # Store input for backward pass
         self.A = A
+        self.input_shape = A.shape
+
+        A_flat = A.reshape(-1, self.W.shape[1])
+        Z_flat = A_flat @ self.W.T + self.b  
+        output_shape = self.input_shape[:-1] + (self.W.shape[0],)
+
+        Z = Z_flat.reshape(output_shape)      
         
-        raise NotImplementedError
+        return Z
 
     def backward(self, dLdZ):
         """
@@ -40,12 +49,15 @@ class Linear:
         :return: Gradient of loss wrt input A (*, in_features)
         """
         # TODO: Implement backward pass
-
         # Compute gradients
-        self.dLdA = NotImplementedError
-        self.dLdW = NotImplementedError
-        self.dLdb = NotImplementedError
-        self.dLdA = NotImplementedError
+
+        dLdZ_flat = dLdZ.reshape(-1, self.W.shape[0])
+        A_flat = self.A.reshape(-1, self.W.shape[1])
+
+        self.dLdW = dLdZ_flat.T @ A_flat 
+        self.dLdb = np.sum(dLdZ_flat, axis = 0)
+        dLdA_flat = dLdZ_flat @ self.W
         
+        self.dLdA = dLdA_flat.reshape(self.input_shape)
         # Return gradient of loss wrt input
-        raise NotImplementedError
+        return self.dLdA
