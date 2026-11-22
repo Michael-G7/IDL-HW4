@@ -3,6 +3,7 @@ from .scaled_dot_product_attention import ScaledDotProductAttention
 import numpy as np
 from typing import Optional
 
+
 class GroupedQueryAttention:
     """
     Grouped Query Attention
@@ -38,19 +39,15 @@ class GroupedQueryAttention:
         self.head_dim      = embed_dim // num_heads
         self.num_kv_groups = num_heads // num_kv_heads
 
-        # TODO: Implement the attention layer and the projections
-
         # Initialize your scaled dot product attention layer
-        self.attention = NotImplementedError
+        self.attention = ScaledDotProductAttention()
 
         # Initialize your linear layers
-        # Query is projected to embed_dim, but key and value are compact:
-        # they carry num_kv_heads heads instead of num_heads.
-        # What output size does that give the key and value projections?
-        self.q_proj   = NotImplementedError
-        self.k_proj   = NotImplementedError
-        self.v_proj   = NotImplementedError
-        self.out_proj = NotImplementedError
+        kv_dim = self.num_kv_heads * self.head_dim
+        self.q_proj   = Linear(embed_dim, embed_dim)
+        self.k_proj   = Linear(embed_dim, kv_dim)
+        self.v_proj   = Linear(embed_dim, kv_dim)
+        self.out_proj = Linear(embed_dim, embed_dim)
 
     def init_weights(
         self,
@@ -89,42 +86,38 @@ class GroupedQueryAttention:
         :param attn_mask: (L, S) where 1/True indicates positions to ignore
         :return: (N, L, E)
         """
-
-        # TODO: Implement forward pass
-
         self.N = query.shape[0]
         self.L = query.shape[1]
         self.S = key.shape[1]
         self.E = query.shape[2]
 
         # Project inputs
-        q = NotImplementedError
-        k = NotImplementedError
-        v = NotImplementedError
+        q = self.q_proj.forward(query)
+        k = self.k_proj.forward(key)
+        v = self.v_proj.forward(value)
 
         # Reshape for multiple heads
-        # Query and key/value do not use the same head count here
-        q = NotImplementedError
-        k = NotImplementedError
-        v = NotImplementedError
+        q = self._split_heads(q, self.num_heads)
+        k = self._split_heads(k, self.num_kv_heads)
+        v = self._split_heads(v, self.num_kv_heads)
 
         # Repeat key/value heads for their query groups
-        k = NotImplementedError
-        v = NotImplementedError
+        k = self._repeat_kv(k)
+        v = self._repeat_kv(v)
 
         # Combine padding and causal masks
-        mask = NotImplementedError
+        mask = self._merge_masks(key_padding_mask, attn_mask)
 
         # Apply attention
-        attn_outputs = NotImplementedError
+        attn_outputs = self.attention.forward(q, k, v, mask=mask)
 
         # Merge heads
-        attn_output = NotImplementedError
+        attn_output = self._concat_heads(attn_outputs)
 
         # Final projection
-        output = NotImplementedError
+        output = self.out_proj.forward(attn_output)
 
-        raise NotImplementedError
+        return output
 
     def backward(
         self,
@@ -133,33 +126,30 @@ class GroupedQueryAttention:
         """
         Backward pass for grouped query attention.
         """
-
-        # TODO: Implement backward pass
-
         # Backpropagate through output projection
-        d_attn_output = NotImplementedError
+        d_attn_output = self.out_proj.backward(d_output)
 
         # Undo head splitting
-        d_attn_outputs = NotImplementedError
+        d_attn_outputs = self._split_heads(d_attn_output, self.num_heads)
 
         # Backpropagate through attention
-        d_q, d_k, d_v = NotImplementedError
+        d_q, d_k, d_v = self.attention.backward(d_attn_outputs)
 
         # Reduce the repeated key/value gradients back to compact heads
-        d_k = NotImplementedError
-        d_v = NotImplementedError
+        d_k = self._sum_kv_gradients(d_k)
+        d_v = self._sum_kv_gradients(d_v)
 
         # Merge head gradients
-        d_q = NotImplementedError
-        d_k = NotImplementedError
-        d_v = NotImplementedError
+        d_q = self._concat_heads(d_q)
+        d_k = self._concat_heads(d_k)
+        d_v = self._concat_heads(d_v)
 
         # Backpropagate through input projections
-        d_q = NotImplementedError
-        d_k = NotImplementedError
-        d_v = NotImplementedError
+        d_q = self.q_proj.backward(d_q)
+        d_k = self.k_proj.backward(d_k)
+        d_v = self.v_proj.backward(d_v)
 
-        raise NotImplementedError
+        return d_q, d_k, d_v
 
     def _merge_masks(
         self,
@@ -170,16 +160,30 @@ class GroupedQueryAttention:
         Merge two mask types into a single mask.
         The masks are applied after the key/value heads have been repeated.
         """
-        # TODO: Implement mask merging
+        if key_padding_mask is None and attn_mask is None:
+            return None
 
-        # Expand masks for broadcasting
-        key_mask = NotImplementedError
-        attention_mask = NotImplementedError
+        # Expand masks for broadcasting to (N, num_heads, L, S)
+        key_mask = (
+            key_padding_mask.astype(bool)[:, None, None, :]
+            if key_padding_mask is not None
+            else None
+        )
+        attention_mask = (
+            attn_mask.astype(bool)[None, None, :, :]
+            if attn_mask is not None
+            else None
+        )
 
         # Combine masks
-        combined_mask = NotImplementedError
+        if key_mask is not None and attention_mask is not None:
+            combined_mask = np.logical_or(key_mask, attention_mask)
+        elif key_mask is not None:
+            combined_mask = key_mask
+        else:
+            combined_mask = attention_mask
 
-        raise NotImplementedError
+        return combined_mask
 
     def _split_heads(
         self,
@@ -195,13 +199,11 @@ class GroupedQueryAttention:
         # Select the head count for this call (DO NOT MODIFY)
         num_heads = self.num_heads if num_heads is None else num_heads
 
-        # TODO: Implement head splitting
+        N, T, _ = x.shape
+        x = x.reshape(N, T, num_heads, self.head_dim)
+        x = x.transpose(0, 2, 1, 3)
 
-        # Reshape and transpose for heads
-        x = NotImplementedError
-        x = NotImplementedError
-
-        raise NotImplementedError
+        return x
 
     def _concat_heads(self, x: np.ndarray) -> np.ndarray:
         """
@@ -212,13 +214,11 @@ class GroupedQueryAttention:
         :param x: (N, num_heads, T, embed_dim // num_heads)
         :return: (N, T, embed_dim)
         """
-        # TODO: Implement head concatenation
+        N, num_heads, T, head_dim = x.shape
+        x = x.transpose(0, 2, 1, 3)
+        x = x.reshape(N, T, num_heads * head_dim)
 
-        # Transpose and reshape
-        x = NotImplementedError
-        x = NotImplementedError
-
-        raise NotImplementedError
+        return x
 
     def _repeat_kv(self, x: np.ndarray) -> np.ndarray:
         """
@@ -226,14 +226,8 @@ class GroupedQueryAttention:
         :param x: (N, num_kv_heads, S, head_dim)
         :return: (N, num_heads, S, head_dim)
         """
-        # TODO: Implement key/value head repetition
-
-        # Each head is needed num_kv_groups times
-        # Think about where the copies of one head have to sit so that a
-        # query head lines up with the key/value head of its own group
-        x = NotImplementedError
-
-        raise NotImplementedError
+        x = np.repeat(x, self.num_kv_groups, axis=1)
+        return x
 
     def _sum_kv_gradients(self, x: np.ndarray) -> np.ndarray:
         """
@@ -241,11 +235,7 @@ class GroupedQueryAttention:
         :param x: (N, num_heads, S, head_dim)
         :return: (N, num_kv_heads, S, head_dim)
         """
-        # TODO: Implement the group reduction
-
-        # This undoes _repeat_kv, and the adjoint of a repeat is a sum
-        # Think about how to expose the group structure inside the head
-        # dimension, and which part of it you should reduce over
-        x = NotImplementedError
-
-        raise NotImplementedError
+        N, _, S, head_dim = x.shape
+        x = x.reshape(N, self.num_kv_heads, self.num_kv_groups, S, head_dim)
+        x = x.sum(axis=2)
+        return x

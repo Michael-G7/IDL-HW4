@@ -13,40 +13,6 @@ SHARD_DTYPE = np.dtype("<u2")
 MANIFEST_FILENAME = "manifest.json"
 FORMAT_VERSION = 3
 
-'''
-Specification:
-This dataset supplies fixed-length examples for next-token language modeling.
-The text is tokenized ahead of time with GPT-2 BPE and stored in compact uint16
-shards so that a large corpus does not need to be loaded into memory at once.
-
-1. Dataset Layout:
-   - Each partition contains a manifest and one or more token shards
-   - The manifest records tokenizer identity and corpus statistics
-   - Shards are opened lazily with NumPy memory maps
-
-2. Training Examples:
-   - Read context_length + 1 contiguous token IDs
-   - Return the first context_length IDs as inputs
-   - Return the same window shifted by one position as targets
-   - Never cross a shard boundary
-
-3. Dataset Properties:
-   - Tracks total characters and serialized tokens for perplexity conversion
-   - Supports deterministic prompt sampling for generation
-   - Uses fixed-size examples, so PyTorch's default collator is sufficient
-
-Usage:
-- Construct one LMDataset for each train/val/test partition
-- Use a regular DataLoader or the provided collate_fn
-- Use sample_prompts when checking model generations
-
-TODO:
-- Count valid fixed windows in every shard
-- Map dataset indices to memory-mapped shard windows
-- Return one-token-shifted input and target tensors
-- Collate fixed-window batches
-'''
-
 
 class LMDataset(Dataset):
     """
@@ -105,7 +71,6 @@ class LMDataset(Dataset):
         ):
             raise ValueError("stride must be a positive integer")
 
-
         # Store configuration and other args
         self.root = Path(root).resolve()
         self.partition = partition
@@ -118,7 +83,6 @@ class LMDataset(Dataset):
 
         # Load the partition manifest
         manifest = self._load_manifest(self.manifest_path)
-
 
         # Store tokenizer and corpus statistics
         self.vocab_size = int(manifest["vocab_size"])
@@ -137,6 +101,7 @@ class LMDataset(Dataset):
 
         # Initialize tracking variables
         cumulative_windows = 0
+        window_size = self.context_length + 1
 
         # Count valid fixed windows in each shard
         for shard in manifest["shards"]:
@@ -145,19 +110,18 @@ class LMDataset(Dataset):
             self.shard_paths.append(shard_path)
             self.shard_lengths.append(num_tokens)
 
-            # TODO: Count the windows in this shard. A next-token example
-            # needs context_length + 1 token IDs, and a window must never
-            # cross a shard boundary.
-            num_windows = NotImplementedError
+            if num_tokens < window_size:
+                num_windows = 0
+            else:
+                num_windows = (num_tokens - window_size) // self.stride + 1
 
             # Build prefix sums for mapping global indices to shards
             self.windows_per_shard.append(num_windows)
             cumulative_windows += num_windows
             self.cumulative_windows.append(cumulative_windows)
 
-
-        # TODO: Store the number of valid windows in the dataset.
-        self.length = NotImplementedError
+        # Store the number of valid windows in the dataset
+        self.length = cumulative_windows
 
         # Initialize the lazy memory-map cache
         self._mmap_cache: dict[int, np.memmap] = {}
@@ -168,104 +132,64 @@ class LMDataset(Dataset):
         with path.open(encoding="utf-8") as file:
             return json.load(file)
 
-
-
     def _shard_entry(self, shard: dict) -> tuple[Path, int]:
         return self.data_dir / shard["file"], int(shard["num_tokens"])
 
     def __len__(self) -> int:
-        """Returns the number of fixed-length samples in the dataset.
-
-        Returns:
-            Number of examples.
-        """
-        # TODO: Return the number of fixed-window examples.
-        raise NotImplementedError
+        """Returns the number of fixed-length samples in the dataset."""
+        return self.length
 
     def _get_shard(self, shard_index: int) -> np.memmap:
-        """Open a shard lazily and reuse its memory map.
+        """Open a shard lazily and reuse its memory map."""
+        if shard_index in self._mmap_cache:
+            return self._mmap_cache[shard_index]
 
-        Args:
-            shard_index: Index into ``self.shard_paths``.
-
-        Returns:
-            Read-only memory map for the selected shard.
-        """
-        # TODO: Open the selected shard as a read-only np.memmap on first
-        # access, cache it in self._mmap_cache, and return it.
-        raise NotImplementedError
+        shard_path = self.shard_paths[shard_index]
+        shard_length = self.shard_lengths[shard_index]
+        shard = np.memmap(
+            shard_path,
+            dtype=SHARD_DTYPE,
+            mode="r",
+            shape=(shard_length,),
+        )
+        self._mmap_cache[shard_index] = shard
+        return shard
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Read one next-token training example.
-
-        Args:
-            idx: Dataset example index.
-
-        Returns:
-            Input tokens and one-position-shifted target tokens.
-
-        Raises:
-            TypeError: If ``idx`` is not an integer.
-            IndexError: If ``idx`` is outside the dataset.
-        """
-        # Add input validation
+        """Read one next-token training example."""
         if not isinstance(idx, Integral):
             raise TypeError("Dataset index must be an integer")
         index = int(idx)
         if index < 0 or index >= self.length:
             raise IndexError("Dataset index out of range")
 
-        # TODO: Use cumulative_windows and bisect_right to find the shard,
-        # local window index, and [start:stop] token range for this example.
-        shard_index = NotImplementedError
-        previous_windows = NotImplementedError
-        local_index = NotImplementedError
-        start = NotImplementedError
-        stop = NotImplementedError
+        shard_index = bisect_right(self.cumulative_windows, index)
+        previous_windows = (
+            self.cumulative_windows[shard_index - 1] if shard_index > 0 else 0
+        )
+        local_index = index - previous_windows
+        start = local_index * self.stride
+        stop = start + self.context_length + 1
 
-        # TODO: Read context_length + 1 contiguous IDs from the selected
-        # memory-mapped shard and copy them into an int64 NumPy array.
-        shard = NotImplementedError
-        window_array = NotImplementedError
-        # TODO: Convert the window to a torch.long tensor. Return its first
-        # context_length tokens as inputs and its one-position shift as targets.
-        window = NotImplementedError
-        inputs = NotImplementedError
-        targets = NotImplementedError
-        raise NotImplementedError
+        shard = self._get_shard(shard_index)
+        window_array = np.array(shard[start:stop], dtype=np.int64, copy=True)
+        window = torch.from_numpy(window_array)
+        inputs = window[:-1]
+        targets = window[1:]
+        return inputs, targets
 
     def collate_fn(
         self,
         batch: list[tuple[torch.Tensor, torch.Tensor]],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Stack fixed-length examples into a batch.
-
-        Args:
-            batch: Input/target pairs returned by ``__getitem__``.
-
-        Returns:
-            Batched inputs and targets. PyTorch's default collator produces
-            the same result, so this method is optional.
-        """
-        # TODO: Unzip the input/target pairs and stack each group along the
-        # batch dimension. The default PyTorch collator should produce the
-        # same two tensors.
-        inputs, targets = NotImplementedError
-        batched_inputs = NotImplementedError
-        batched_targets = NotImplementedError
-        raise NotImplementedError
+        """Stack fixed-length examples into a batch."""
+        inputs, targets = zip(*batch)
+        batched_inputs = torch.stack(inputs, dim=0)
+        batched_targets = torch.stack(targets, dim=0)
+        return batched_inputs, batched_targets
 
     def get_avg_chars_per_token(self) -> float:
-        """Return source characters per serialized LM token.
-
-        ``num_tokens`` includes document-boundary EOT tokens because those
-        tokens are also targets in the language-model loss. This corpus-level
-        ratio is an approximation for character-normalized window metrics:
-        shard tails may be omitted, and non-default strides may overlap.
-
-        Returns:
-            Source characters per serialized token.
-        """
+        """Return source characters per serialized LM token."""
         average = self.avg_chars_per_token
         return average
 
@@ -275,19 +199,7 @@ class LMDataset(Dataset):
         prompt_length: int,
         seed: int | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Sample fixed prompts and their source chunks.
-
-        Args:
-            num_samples: Number of prompts to sample.
-            prompt_length: Number of tokens in each prompt.
-            seed: Optional seed for reproducible sampling.
-
-        Returns:
-            Stacked prompts and their complete source input chunks.
-
-        Raises:
-            ValueError: If counts or lengths are invalid.
-        """
+        """Sample fixed prompts and their source chunks."""
         if not isinstance(num_samples, int) or isinstance(num_samples, bool):
             raise ValueError("num_samples must be a positive integer")
         if num_samples <= 0:
@@ -297,16 +209,9 @@ class LMDataset(Dataset):
         if not 0 < prompt_length < self.context_length:
             raise ValueError("prompt_length must be between 1 and context_length - 1")
 
-        # Use a local random generator so sampling does not alter global state.
         generator = np.random.default_rng(seed)
-
-        # Sample random fixed-window examples.
         indices = generator.integers(0, len(self), size=num_samples)
-
-        # Store complete input chunks as the original sequences.
         originals = [self[int(index)][0] for index in indices]
-
-        # Get exactly prompt_length tokens from each sampled sequence.
         prompts = torch.stack(
             [original[:prompt_length].clone() for original in originals]
         )
@@ -314,12 +219,7 @@ class LMDataset(Dataset):
         return sampled_data
 
     def __getstate__(self) -> dict[str, Any]:
-        """Prepare dataset state for a DataLoader worker.
-
-        Returns:
-            Dataset state with an empty memory-map cache.
-        """
-        # Give each DataLoader worker its own empty memory-map cache
+        """Prepare dataset state for a DataLoader worker."""
         state = self.__dict__.copy()
         state["_mmap_cache"] = {}
         return state
