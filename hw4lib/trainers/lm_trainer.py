@@ -25,13 +25,6 @@ class LMTrainer(BaseTrainer):
     3. Generation with greedy and sampling strategies (beam search is optional)
     4. Metric, attention, generated-text, and checkpoint logging
 
-    TODO:
-    - Initialize summed next-token cross-entropy in ``__init__``.
-    - Complete the fixed-chunk training and validation calculations.
-    - Handle full and partial gradient-accumulation cycles correctly.
-    - Connect the epoch loop to training, validation, and generation.
-    - Call your greedy and sampling implementations from ``generate``.
-
     Implementation Notes:
     1. GPT-2 shards already contain shifted fixed-length windows, so no padding
        index or per-example length tensor is needed.
@@ -64,11 +57,11 @@ class LMTrainer(BaseTrainer):
         """
 
         super().__init__(model, tokenizer, config, run_name, config_file, device)
-        # TODO: Initialize nn.CrossEntropyLoss. Use label_smoothing from the
-        # training config and reduction="sum" so each accumulation cycle can
-        # be normalized by its exact token count.
-        self.criterion = NotImplementedError
-        raise NotImplementedError
+        # Sum token losses now; normalize once per accumulation cycle.
+        self.criterion = nn.CrossEntropyLoss(
+            label_smoothing=config["training"].get("label_smoothing", 0.0),
+            reduction="sum",
+        )
 
 
     @staticmethod
@@ -173,11 +166,10 @@ class LMTrainer(BaseTrainer):
         self.optimizer.zero_grad()
 
         for batch_index, batch in enumerate(dataloader):
-            # TODO: Unpack the fixed (inputs, targets) batch and move both
-            # tensors to self.device.
-            inputs, targets = NotImplementedError
-            inputs = NotImplementedError
-            targets = NotImplementedError
+            # The dataset already supplies shifted, fixed-length token pairs.
+            inputs, targets = batch
+            inputs = inputs.to(self.device)
+            targets = targets.to(self.device)
 
             # Forward pass
             with torch.autocast(
@@ -185,12 +177,11 @@ class LMTrainer(BaseTrainer):
                 dtype=torch.float16,
                 enabled=use_autocast,
             ):
-                # TODO: Run the model. Flatten logits to (B*T, vocab) and
-                # targets to (B*T), then calculate summed cross-entropy.
-                raw_preds, attn_weights = NotImplementedError
-                flat_predictions = NotImplementedError
-                flat_targets = NotImplementedError
-                raw_loss = NotImplementedError
+                # Treat all B*T next-token predictions as one loss batch.
+                raw_preds, attn_weights = self.model(inputs)
+                flat_predictions = raw_preds.reshape(-1, raw_preds.size(-1))
+                flat_targets = targets.reshape(-1)
+                raw_loss = self.criterion(flat_predictions, flat_targets)
 
             # Calculate metrics with raw loss (DO NOT MODIFY THIS)
             batch_tokens = targets.numel()
@@ -200,8 +191,8 @@ class LMTrainer(BaseTrainer):
 
             cycle_start = (batch_index // accumulation_steps) * accumulation_steps
             cycle_size = min(accumulation_steps, num_batches - cycle_start)
-            # TODO: Scale raw_loss and backpropagate it.
-            raise NotImplementedError
+            # Keep the loss summed until every microbatch in this cycle is seen.
+            self.scaler.scale(raw_loss).backward()
 
             if attention_snapshot is None:
                 attention_snapshot = self._attention_snapshot(attn_weights)
@@ -213,11 +204,18 @@ class LMTrainer(BaseTrainer):
                 or batch_index + 1 == num_batches
             )
             if should_step:
-                # TODO: Unscale the gradients and divide every existing
-                # gradient by cycle_tokens. Step and update the scaler, then
-                # use _optimizer_step_ran to detect an overflow-skipped step.
-                optimizer_step_ran = NotImplementedError
-                raise NotImplementedError
+                # Normalize by the actual token count, including a short final cycle.
+                self.scaler.unscale_(self.optimizer)
+                for parameter in self.model.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.div_(cycle_tokens)
+                scale_before_step = self.scaler.get_scale()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                optimizer_step_ran = self._optimizer_step_ran(
+                    scale_before_step,
+                    self.scaler.get_scale(),
+                )
                 # DO NOT MODIFY: count only optimizer updates that AMP did not
                 # skip because of an overflow.
                 if optimizer_step_ran:
@@ -296,16 +294,14 @@ class LMTrainer(BaseTrainer):
 
         with torch.inference_mode():
             for batch in dataloader:
-                # TODO: Unpack and move the fixed input/target batch, run the
-                # model, flatten logits and targets, and calculate summed loss.
-                inputs, targets = NotImplementedError
-                inputs = NotImplementedError
-                targets = NotImplementedError
-                raw_preds, attn_weights = NotImplementedError
-                flat_predictions = NotImplementedError
-                flat_targets = NotImplementedError
-                loss_sum = NotImplementedError
-                raise NotImplementedError
+                # Use the same summed token loss as training, without gradients.
+                inputs, targets = batch
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
+                raw_preds, attn_weights = self.model(inputs)
+                flat_predictions = raw_preds.reshape(-1, raw_preds.size(-1))
+                flat_targets = targets.reshape(-1)
+                loss_sum = self.criterion(flat_predictions, flat_targets)
 
                 if attention_snapshot is None:
                     attention_snapshot = self._attention_snapshot(attn_weights)
@@ -371,11 +367,10 @@ class LMTrainer(BaseTrainer):
         for epoch in range(self.current_epoch, stop_epoch):
             if hasattr(train_dataloader.sampler, "set_epoch"):
                 train_dataloader.sampler.set_epoch(epoch)
-            # TODO: Train for one epoch, validate, and generate from the
-            # validation data.
-            train_metrics, train_attention = NotImplementedError
-            val_metrics, val_attention = NotImplementedError
-            gen_results = NotImplementedError
+            # Run each stage before logging and checkpointing the epoch.
+            train_metrics, train_attention = self._train_epoch(train_dataloader)
+            val_metrics, val_attention = self._validate_epoch(val_dataloader)
+            gen_results = self.generate(val_dataloader)
 
             # Step ReduceLROnPlateau scheduler with validation loss
             if isinstance(
@@ -583,10 +578,15 @@ class LMTrainer(BaseTrainer):
         with torch.inference_mode():
             if sampling_enabled:
                 effective_top_p = top_p if top_p > 0 else 1.0
-                # TODO: Call generator.generate_sample with the prompts,
-                # temperature, top-k, top-p, repeat penalty, and seed.
-                sequences, scores = NotImplementedError
-                raise NotImplementedError
+                # Filter the distribution before drawing each next token.
+                sequences, scores = generator.generate_sample(
+                    prompts,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=effective_top_p,
+                    repeat_penalty=repeat_penalty,
+                    seed=seed,
+                )
             elif beam_width > 1:
                 # Beam search is not required or graded. If you implement it,
                 # call generate_beam here and select beam 0 below.
@@ -596,10 +596,11 @@ class LMTrainer(BaseTrainer):
                 sequences = beam_sequences[:, 0]
                 scores = beam_scores[:, 0]
             else:
-                # TODO: Call generator.generate_greedy with the prompts and
-                # repeat penalty.
-                sequences, scores = NotImplementedError
-                raise NotImplementedError
+                # Select the highest-probability token at each step.
+                sequences, scores = generator.generate_greedy(
+                    prompts,
+                    repeat_penalty=repeat_penalty,
+                )
 
         # Post-process sequences (trim upto EOS token)
         processed_sequences = generator.post_process_sequence(

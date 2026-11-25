@@ -5,9 +5,7 @@ import torch
 from ..data import H4Tokenizer
 
 '''
-TODO: Implement the `generate_greedy`, `_filter_logits`, and `generate_sample`
-methods of the `SequenceGenerator` class. `generate_beam` is optional and is
-not graded.
+`generate_beam` is optional and is not graded.
 
 This file implements text generation strategies for transformer language models:
 
@@ -186,7 +184,6 @@ class SequenceGenerator:
             top_p: float = 1.0
     ) -> torch.Tensor:
         '''
-        TODO: Implement this method.
         Specification:
         - Apply temperature, top-k, and top-p filtering, in that order.
         - top-k only applies when top_k > 0.
@@ -194,8 +191,27 @@ class SequenceGenerator:
         - Filtering must mask tokens by setting their logit to float('-inf'),
           not by removing them from the tensor, so the shape never changes.
         '''
-        # TODO: Scale by temperature, apply top-k, then apply top-p.
-        raise NotImplementedError
+        # Scale by temperature, apply top-k, then apply top-p.
+        filtered = logits / temperature
+        if 0 < top_k < filtered.size(-1):
+            top_indices = torch.topk(filtered, top_k, dim=-1).indices
+            keep = torch.zeros_like(filtered, dtype=torch.bool)
+            keep.scatter_(-1, top_indices, True)
+            filtered = filtered.masked_fill(~keep, float("-inf"))
+
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(
+                filtered, descending=True, dim=-1
+            )
+            cumulative_probs = torch.softmax(sorted_logits, dim=-1).cumsum(-1)
+            remove_sorted = cumulative_probs > top_p
+            remove_sorted[..., 1:] = remove_sorted[..., :-1].clone()
+            remove_sorted[..., 0] = False
+            remove = torch.zeros_like(remove_sorted)
+            remove.scatter_(-1, sorted_indices, remove_sorted)
+            filtered = filtered.masked_fill(remove, float("-inf"))
+
+        return filtered
 
     def generate_greedy(
             self,
@@ -220,10 +236,38 @@ class SequenceGenerator:
         if repeat_penalty <= 0:
             raise ValueError("repeat_penalty must be > 0")
 
-        # TODO: Implement greedy search.
+        # Generate one token at a time, retaining scores for unfinished rows.
         # When cache_score_fn is provided, prefill it with the complete prompt,
         # then pass only the newest generated token on later decoding steps.
-        raise NotImplementedError  # Remove once implemented
+        scores = torch.zeros(x.size(0), device=x.device)
+        finished = torch.zeros(x.size(0), dtype=torch.bool, device=x.device)
+        cache = None
+        cache_input = x
+
+        for _ in range(self.max_length - x.size(1)):
+            if finished.all():
+                break
+
+            next_logits, cache = self._score_next(x, cache_input, cache)
+            next_logits = self._apply_repeat_penalty(
+                next_logits, x, repeat_penalty
+            )
+            log_probs = torch.log_softmax(next_logits, dim=-1)
+            next_tokens = log_probs.argmax(dim=-1)
+            next_tokens = torch.where(
+                finished,
+                torch.full_like(next_tokens, self.tokenizer.eos_id),
+                next_tokens,
+            )
+            token_scores = log_probs.gather(
+                1, next_tokens.unsqueeze(1)
+            ).squeeze(1)
+            scores = torch.where(finished, scores, scores + token_scores)
+            x = torch.cat([x, next_tokens.unsqueeze(1)], dim=1)
+            cache_input = next_tokens.unsqueeze(1)
+            finished |= next_tokens == self.tokenizer.eos_id
+
+        return x, scores
 
     def generate_beam(
             self,
@@ -287,7 +331,7 @@ class SequenceGenerator:
              - sequences is of shape (batch_size, sequence_length)
              - scores is of shape (batch_size,)
 
-        TODO: Complete filtered sampling.
+        Draw from the filtered next-token distribution.
         """
         # Add input validation (DO NOT MODIFY)
         x = self._prepare_input(x)
@@ -332,8 +376,15 @@ class SequenceGenerator:
                 repeat_penalty,
             )
 
-            # TODO: Filter logits and compute log-probabilities and probabilities.
-            raise NotImplementedError
+            # Filter logits and compute log-probabilities and probabilities.
+            filtered_logits = self._filter_logits(
+                next_scores,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+            log_probs = torch.log_softmax(filtered_logits, dim=-1)
+            probs = torch.softmax(filtered_logits, dim=-1)
 
             # Draw from the filtered probability distribution (DO NOT MODIFY)
             next_tokens = torch.multinomial(
@@ -361,8 +412,7 @@ class SequenceGenerator:
             is_eos = (next_tokens == self.tokenizer.eos_id)
             finished = finished | is_eos
 
-        # TODO: Return the generated sequences and scores.
-        raise NotImplementedError
+        return x, scores
 
     @staticmethod
     def post_process_sequence(
