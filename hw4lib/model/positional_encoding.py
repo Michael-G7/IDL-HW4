@@ -2,47 +2,13 @@ import torch
 from torch import nn
 import math
 
-'''
-TODO: Implement these Modules.
-
-This file contains two ways of giving a transformer positional information:
-
-1. PositionalEncoding: Fixed sinusoidal encoding added to the token embeddings
-   - Added once, before the first layer
-   - Encodes absolute position
-
-2. RotaryPositionalEncoding: Rotates queries and keys inside each attention operation
-   - Applied per head, after the q/k projections and the reshape into heads
-   - Encodes relative position
-
-Specification for RotaryPositionalEncoding:
-- Applied to queries and keys only, never to values
-- Pairs dimension i with dimension i + head_dim//2 (the "split-half" convention
-  used by Llama and HuggingFace), not with dimension i+1
-- The angle for position t and pair i is t / (base ** (2i / head_dim))
-- cos and sin are registered as buffers of shape (1, 1, max_len, head_dim),
-  so that they broadcast over batch and head
-'''
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len):
-        """
-        Initialize the PositionalEncoding.
-        Args:
-            d_model (int): The dimension of the model.
-            max_len (int): The maximum length of the input sequence.
-        """     
         super().__init__()
         self.create_pe_table(d_model, max_len)
 
     def create_pe_table(self, d_model, max_len):
-        """
-        Create the positional encoding table.
-        
-        Args:
-            d_model (int): The dimension of the model.
-            max_len (int): The maximum length of the input sequence.
-        """
         positions = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
         div_term = torch.exp(
             torch.arange(0, d_model, 2, dtype=torch.float32)
@@ -51,108 +17,67 @@ class PositionalEncoding(nn.Module):
         pe = torch.zeros(1, max_len, d_model, dtype=torch.float32)
         pe[0, :, 0::2] = torch.sin(positions * div_term)
         pe[0, :, 1::2] = torch.cos(positions * div_term[: pe[0, :, 1::2].shape[-1]])
-        # Register as buffer to save with model state
-        self.register_buffer('pe', pe)
-        
+        self.register_buffer("pe", pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the PositionalEncoding.
-        Args:
-            x (torch.Tensor): The input tensor of shape (B x T x d_model)
-        Returns:
-            torch.Tensor: Input with positional encoding added (B x T x d_model)
-        Errors:
-            - ValueError: If sequence length exceeds maximum length 
-        """
         seq_len = x.size(1)
-        # Step 2: Verify sequence length doesn't exceed maximum length, raise error if it does
         if seq_len > self.pe.size(1):
-            raise ValueError(f"Sequence length {seq_len} exceeds the maximum length {self.pe.size(1)}")
+            raise ValueError(
+                f"Sequence length {seq_len} exceeds the maximum length {self.pe.size(1)}"
+            )
         return x + self.pe[:, :seq_len].to(device=x.device, dtype=x.dtype)
 
 
 class RotaryPositionalEncoding(nn.Module):
-    """
-    Rotary Positional Encoding (RoPE).
-    Rotates queries and keys so that attention scores depend on relative position.
-    """
-    def __init__(self, head_dim, max_len, base=10000.0):
-        """
-        Initialize the RotaryPositionalEncoding.
-        Args:
-            head_dim (int): The dimension of each attention head. Must be even.
-            max_len  (int): The maximum length of the input sequence.
-            base   (float): The base of the geometric progression of wavelengths.
-        """
+    """Apply rotary position information to attention queries and keys."""
+
+    def __init__(self, head_dim: int, max_len: int, base: float = 10_000.0):
         super().__init__()
+        if head_dim <= 0:
+            raise ValueError("head_dim must be positive")
         if head_dim % 2 != 0:
-            raise ValueError(f"head_dim must be even for RoPE, but got {head_dim}")
+            raise ValueError("head_dim must be even for rotary encoding")
+        if max_len <= 0:
+            raise ValueError("max_len must be positive")
+        if base <= 0:
+            raise ValueError("base must be positive")
+
         self.head_dim = head_dim
-        self.create_rope_table(head_dim, max_len, base)
+        self.max_len = max_len
 
-    def create_rope_table(self, head_dim, max_len, base):
-        """
-        Create the rotation tables.
-        Args:
-            head_dim (int): The dimension of each attention head.
-            max_len  (int): The maximum length of the input sequence.
-            base   (float): The base of the geometric progression of wavelengths.
-        """
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, head_dim // 2, dtype=torch.float32) * 2.0 / head_dim)
-        )
+        dimensions = torch.arange(0, head_dim, 2, dtype=torch.float32)
+        inverse_frequencies = 1.0 / (base ** (dimensions / head_dim))
+
         positions = torch.arange(max_len, dtype=torch.float32)
-        angles = torch.outer(positions, inv_freq)
-        angles = torch.cat((angles, angles), dim=-1)
-        cos = angles.cos().view(1, 1, max_len, head_dim)
-        sin = angles.sin().view(1, 1, max_len, head_dim)
-        # Register as buffers to save with model state
-        self.register_buffer('cos', cos)
-        self.register_buffer('sin', sin)
+        angles = torch.outer(positions, inverse_frequencies)
+        self.register_buffer("cos", torch.cos(angles), persistent=False)
+        self.register_buffer("sin", torch.sin(angles), persistent=False)
 
-    def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Rotate the two halves of the last dimension into each other.
-        Given x = [x_0 ... x_{d/2-1}, x_{d/2} ... x_{d-1}], return
-        [-x_{d/2} ... -x_{d-1}, x_0 ... x_{d/2-1}].
-        Args:
-            x (torch.Tensor): Input tensor, shape (..., head_dim)
-        Returns:
-            torch.Tensor: Rotated tensor of the same shape
-        """
+    def forward(self, x: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError("x must have shape (batch, heads, sequence, head_dim)")
         if x.size(-1) != self.head_dim:
-            raise ValueError(f"Expected last dimension {self.head_dim}, got {x.size(-1)}")
-        first, second = x.chunk(2, dim=-1)
-        return torch.cat((-second, first), dim=-1)
+            raise ValueError(
+                f"Expected head_dim {self.head_dim}, but received {x.size(-1)}"
+            )
+        if not isinstance(start_pos, int) or isinstance(start_pos, bool):
+            raise TypeError("start_pos must be an integer")
+        if start_pos < 0:
+            raise ValueError("start_pos must be non-negative")
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, offset: int = 0):
-        """
-        Forward pass for the RotaryPositionalEncoding.
-        Args:
-            q (torch.Tensor): Queries, shape (batch_size, num_heads, seq_len, head_dim)
-            k (torch.Tensor): Keys, shape (batch_size, num_heads, seq_len, head_dim)
-            offset     (int): Index of the first position. Defaults to 0.
-        Returns:
-            q (torch.Tensor): Rotated queries of the same shape
-            k (torch.Tensor): Rotated keys of the same shape
-        Errors:
-            - ValueError: If sequence length exceeds maximum length
-        """
-        if q.ndim != 4 or k.ndim != 4:
-            raise ValueError("q and k must have shape (batch, heads, time, head_dim)")
-        if q.size(-1) != self.head_dim or k.size(-1) != self.head_dim:
-            raise ValueError(f"q and k must have head dimension {self.head_dim}")
-        if q.size(-2) != k.size(-2):
-            raise ValueError("q and k must have the same sequence length for RoPE")
-        seq_len = q.size(-2)
-        # Step 2: Verify sequence length doesn't exceed maximum length, raise error if it does
-        if offset + seq_len > self.cos.size(2):
-            raise ValueError(f"Sequence length {offset + seq_len} exceeds the maximum length {self.cos.size(2)}")
-        cos = self.cos[:, :, offset:offset + seq_len].to(device=q.device, dtype=q.dtype)
-        sin = self.sin[:, :, offset:offset + seq_len].to(device=q.device, dtype=q.dtype)
-        q = q * cos + self.rotate_half(q) * sin
-        k_cos = cos.to(device=k.device, dtype=k.dtype)
-        k_sin = sin.to(device=k.device, dtype=k.dtype)
-        k = k * k_cos + self.rotate_half(k) * k_sin
-        return q, k
+        seq_len = x.size(-2)
+        end_pos = start_pos + seq_len
+        if end_pos > self.max_len:
+            raise ValueError(
+                f"Positions up to {end_pos - 1} exceed max_len {self.max_len}"
+            )
+
+        cos = self.cos[start_pos:end_pos].to(device=x.device, dtype=x.dtype)
+        sin = self.sin[start_pos:end_pos].to(device=x.device, dtype=x.dtype)
+
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        rot_even = x_even * cos - x_odd * sin
+        rot_odd = x_even * sin + x_odd * cos
+        output = torch.stack((rot_even, rot_odd), dim=-1).flatten(-2)
+        return output

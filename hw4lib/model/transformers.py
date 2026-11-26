@@ -13,23 +13,22 @@ from .positional_encoding import PositionalEncoding
 
 ModelCache = Tuple[KVCache, ...]
 
-## -------------------------------------------------------------------------------------------------
-## Decoder-Only Transformer
-## -------------------------------------------------------------------------------------------------
+
 class DecoderOnlyTransformer(nn.Module):
     '''
     A Pre-LN Decoder-Only Transformer model.
     '''
 
     INITIALIZATION_STD = 0.02
+
     def __init__(
-            self, 
-            num_layers: int, 
-            d_model: int, 
-            num_heads: int, 
-            d_ff: int, 
-            dropout: float, 
-            max_len: int, 
+            self,
+            num_layers: int,
+            d_model: int,
+            num_heads: int,
+            d_ff: int,
+            dropout: float,
+            max_len: int,
             num_classes: int,
             weight_tying: bool = False,
             layer_drop_rate: float = 0.0,
@@ -37,23 +36,6 @@ class DecoderOnlyTransformer(nn.Module):
             rope_base: float = 10_000.0,
             use_rope: bool = True,
     ) -> None:
-        '''
-        Initialize the Decoder-Only Transformer model.
-
-        Args:
-            num_layers: int, number of decoder layers
-            d_model: int, model dimension
-            num_heads: int, number of attention heads
-            d_ff: int, feed-forward dimension
-            dropout: float, dropout rate
-            max_len: int, maximum sequence length this model can handle
-            num_classes: int, number of classes
-            weight_tying: bool, whether to use weight tying (default: False)
-            layer_drop_rate: float, layer drop rate (default: 0.0)
-            num_kv_heads: Optional[int], number of key/value heads (default: MHA)
-            rope_base: float, frequency base used by rotary positions
-            use_rope: bool, whether to use rotary positions (default: True)
-        '''
         super().__init__()
 
         # DO NOT MODIFY: public configuration and cache contracts.
@@ -77,19 +59,24 @@ class DecoderOnlyTransformer(nn.Module):
         self.num_kv_heads    = num_heads if num_kv_heads is None else num_kv_heads
         self.use_rope        = use_rope
 
-        # TODO: Implement __init__:
-        # Create decoder layers, target embedding, positional encoding,
-        # dropout, layer norm, and final linear layer. Pass use_rope, max_len,
-        # self.num_kv_heads, and rope_base into every decoder layer so the
-        # model-level head configuration matches CausalSelfAttention exactly.
-        self.dec_layers     = NotImplementedError # ModuleList of decoder layers
-        self.target_embedding       = NotImplementedError 
-        self.positional_encoding    = NotImplementedError 
-        self.final_linear           = NotImplementedError 
-        self.dropout                = NotImplementedError 
-        self.norm                   = NotImplementedError # Layer norm
-
-        raise NotImplementedError # Remove once implemented
+        self.dec_layers = nn.ModuleList([
+            SelfAttentionDecoderLayer(
+                d_model=d_model,
+                num_heads=num_heads,
+                d_ff=d_ff,
+                dropout=dropout,
+                use_rope=use_rope,
+                max_len=max_len,
+                num_kv_heads=self.num_kv_heads,
+                rope_base=rope_base,
+            )
+            for _ in range(num_layers)
+        ])
+        self.target_embedding    = nn.Embedding(num_classes, d_model)
+        self.positional_encoding = PositionalEncoding(d_model, max_len)
+        self.final_linear        = nn.Linear(d_model, num_classes)
+        self.dropout             = nn.Dropout(dropout)
+        self.norm                = nn.LayerNorm(d_model)
 
         # DO NOT MODIFY
         self.apply(self._initialize_module)
@@ -173,15 +160,6 @@ class DecoderOnlyTransformer(nn.Module):
         return lengths.pop()
 
     def forward(self, padded_targets: torch.Tensor, target_lengths: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, dict]:
-        '''
-        Forward pass for the decoder. Used for Training only. Tokens are assumed to be right-padded.
-        Args:
-            padded_targets (torch.Tensor): The padded target sequence. shape: (batch_size, seq_len)
-            target_lengths (Optional[torch.Tensor]): The lengths of the target sequences. shape: (batch_size,)
-        Returns:
-            seq_out (torch.Tensor): The output sequence. shape: (batch_size, seq_len, d_model)
-            runnint_att (dict): The attention weights. shape: (batch_size, seq_len, seq_len)
-        '''
         # DO NOT MODIFY: HW4P1 uses fixed, unpadded language-model chunks, so
         # target_lengths is optional during both training and evaluation.
         if padded_targets.ndim != 2:
@@ -207,54 +185,42 @@ class DecoderOnlyTransformer(nn.Module):
                 raise ValueError(
                     "HW4P1 uses fixed, unpadded chunks; all lengths must equal T"
                 )
-        
-        # TODO: Implement forward
 
-        # TODO: Create padding mask for padded_targets on the same device as the input (use PadMask)
         pad_mask_dec = None
         if target_lengths is not None:
-            pad_mask_dec = NotImplementedError
-        
-        # TODO: The additive-position path uses CausalMask. Rotary attention
-        # constructs its own cache-aware rectangular causal mask.
-        causal_mask = NotImplementedError
+            pad_mask_dec = PadMask(padded_targets, target_lengths).to(padded_targets.device)
 
-        # TODO: Apply embedding and dropout. Apply additive positional
-        # encoding only when use_rope is False; RoPE runs inside attention.
-        x = NotImplementedError
+        causal_mask = (
+            None
+            if self.use_rope
+            else CausalMask(padded_targets).to(padded_targets.device)
+        )
 
-        # TODO: Pass through decoder layers and save attention
+        x = self.target_embedding(padded_targets)
+        if not self.use_rope:
+            x = self.positional_encoding(x)
+        x = self.dropout(x)
+
         runnint_att = {}
         for i in range(self.num_layers):
-            # Optionally apply LayerDrop during training (More regularization!)
             if self.training and self.layer_drop_rate > 0 and random.random() < self.layer_drop_rate:
                 continue
-            
-            x, attention = NotImplementedError, NotImplementedError
+
+            x, attention = self.dec_layers[i](
+                x,
+                key_padding_mask=pad_mask_dec,
+                attn_mask=causal_mask,
+            )
             runnint_att['layer{}_dec_self'.format(i + 1)] = attention
 
-        # TODO: Final normalization and projection for next character prediction
-        seq_out = NotImplementedError
-        
-        # TODO: Return the output sequence and running attention weights
-        raise NotImplementedError
-    
+        seq_out = self.final_linear(self.norm(x))
+
+        return seq_out, runnint_att
+
     def score(self, batch_prompts: torch.Tensor) -> torch.Tensor:
-        '''
-        Score the tokens for the decoder. 
-        This is used for scoring the next token for a given prompt.
-        Padding mask is not applied so ensure that the prompts are not padded. 
-        Can only handle batch_size = 1 or batch with same lengths and no padding. 
-        Args:
-            prompts (torch.Tensor) : tensor of fixed length token sequences. shape: (batch_size, seq_len)
-        Returns:
-            logits (torch.Tensor): Batch of next token logits. shape: (batch_size, num_classes)
-        '''
         if self.training:
             raise ValueError("score method is not supported during training, use forward method instead")
-        # Forward pass with no target lengths
         seq_out, _ = self.forward(batch_prompts, target_lengths=None)
-        # Return the last token's logits for next token prediction    
         logits     = seq_out[:, -1, :]
         return logits
 
@@ -263,14 +229,6 @@ class DecoderOnlyTransformer(nn.Module):
         padded_targets: torch.Tensor,
         past_key_values: Optional[ModelCache] = None,
     ) -> Tuple[torch.Tensor, dict, ModelCache]:
-        '''
-        TODO: Process only new token IDs and progressively extend every
-        decoder layer's compact KV cache.
-
-        The first call is the prompt prefill. Later generation calls normally
-        contain one token. Every returned layer cache must retain
-        num_kv_heads, never the repeated num_heads used inside attention.
-        '''
         # DO NOT MODIFY: cached decoding is rotary inference only.
         if self.training:
             raise ValueError("KV caching is inference-only; call model.eval() first")
@@ -290,13 +248,8 @@ class DecoderOnlyTransformer(nn.Module):
                 f"Context length {context_length} exceeds max_len={self.max_len}"
             )
 
-        # TODO: Embed and drop out only padded_targets (the new chunk). RoPE
-        # obtains absolute positions from each layer's cache length.
-        x = NotImplementedError
+        x = self.dropout(self.target_embedding(padded_targets))
 
-        # TODO: Select the matching cache for every decoder layer, call
-        # layer.forward_cached, collect attention weights, and append the
-        # returned present_kv in layer order.
         running_att = {}
         present_key_values = []
         layer_caches = (
@@ -307,33 +260,25 @@ class DecoderOnlyTransformer(nn.Module):
         for layer_index, (layer, layer_cache) in enumerate(
             zip(self.dec_layers, layer_caches)
         ):
-            x, attention, present_kv = (
-                NotImplementedError,
-                NotImplementedError,
-                NotImplementedError,
+            x, attention, present_kv = layer.forward_cached(
+                x,
+                past_kv=layer_cache,
             )
             running_att[f"layer{layer_index + 1}_dec_self"] = attention
             present_key_values.append(present_kv)
 
-        # TODO: Apply final normalization and vocabulary projection to the
-        # new positions, convert present_key_values to a tuple, and return all
-        # three values.
-        logits = NotImplementedError
-        present = NotImplementedError
-        raise NotImplementedError
+        logits = self.final_linear(self.norm(x))
+        present = tuple(present_key_values)
+        return logits, running_att, present
 
     def score_cached(
         self,
         padded_targets: torch.Tensor,
         past_key_values: Optional[ModelCache] = None,
     ) -> Tuple[torch.Tensor, ModelCache]:
-        '''TODO: Return next-token logits and the extended model cache.'''
-        # TODO: Call forward_cached, select logits[:, -1, :], and return it
-        # together with the updated cache.
-        logits, _, present_key_values = (
-            NotImplementedError,
-            NotImplementedError,
-            NotImplementedError,
+        logits, _, present_key_values = self.forward_cached(
+            padded_targets,
+            past_key_values=past_key_values,
         )
-        next_token_logits = NotImplementedError
-        raise NotImplementedError
+        next_token_logits = logits[:, -1, :]
+        return next_token_logits, present_key_values
