@@ -4,21 +4,6 @@ from torch import nn
 from typing import Tuple, Optional
 from .positional_encoding import RotaryPositionalEncoding
 
-'''
-TODO: Implement this Module.
-
-Specification:
-- Module should implement causal self-attention for the decoder
-- A single num_kv_heads setting should cover all three head layouts:
-  num_kv_heads == num_heads gives MHA, num_kv_heads == 1 gives MQA, and any
-  divisor in between gives GQA
-- Query always uses num_heads heads, key and value use num_kv_heads heads
-- Queries and keys are rotated by RoPE before the dot product
-- Keys and values are cached in their compact num_kv_heads form and repeated
-  up to num_heads only while attention is computed
-- A query must not attend to a later key, with or without a cache
-'''
-
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
@@ -65,8 +50,7 @@ class CausalSelfAttention(nn.Module):
         self.head_dim      = head_dim
         self.max_len       = max_len
         self.num_kv_groups = num_heads // num_kv_heads
-        # TODO: Use your HW3P2 attention scaling.
-        self.scale         = NotImplementedError
+        self.scale         = head_dim ** -0.5
 
         # TODO: Adapt your HW3P2 projections to num_kv_heads.
 
